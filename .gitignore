@@ -1,0 +1,13 @@
+# Virtual environment
+venv/
+__pycache__/
+
+# Environment variables / secrets
+.env
+
+# OS / editor noise
+.DS_Store
+.vscode/
+
+# PDFs or private files (optional)
+*.pdf

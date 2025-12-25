@@ -1,0 +1,7 @@
+streamlit
+mysql-connector-python
+python-dotenv
+boto3
+spacy
+pdfplumber
+python-docx

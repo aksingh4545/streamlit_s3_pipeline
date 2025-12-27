@@ -1,8 +1,8 @@
 import os
 import re
-import json
+import csv
 import logging
-from datetime import datetime
+
 import pdfplumber
 import spacy
 import mysql.connector
@@ -10,9 +10,7 @@ import boto3
 from docx import Document
 from dotenv import load_dotenv
 
-# --------------------------------------------------
-# ENV + LOGGING
-# --------------------------------------------------
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -24,27 +22,27 @@ logger = logging.getLogger(__name__)
 BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "resume-input-pdfs")
 
 MYSQL_CONFIG = {
-    "host": os.getenv("MYSQL_HOST", "localhost"),
-    "user": os.getenv("MYSQL_USER", "root"),
+    "host": os.getenv("MYSQL_HOST"),
+    "user": os.getenv("MYSQL_USER"),
     "password": os.getenv("MYSQL_PASSWORD"),
-    "database": os.getenv("MYSQL_DB", "resume_db"),
+    "database": os.getenv("MYSQL_DB"),
 }
 
 SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".txt")
 
 s3 = boto3.client("s3")
 nlp = spacy.load("en_core_web_sm")
-
-# --------------------------------------------------
-# FILE READERS
-# --------------------------------------------------
 def read_pdf(path):
     text = ""
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            if page.extract_text():
-                text += page.extract_text() + "\n"
-    return text
+    try:
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+    except Exception as e:
+        logger.error(f"PDF read error: {e}")
+    return text.strip()
 
 
 def read_docx(path):
@@ -59,19 +57,23 @@ def read_txt(path):
 
 def read_file(path):
     ext = os.path.splitext(path)[1].lower()
+
     if ext == ".pdf":
         return read_pdf(path)
     if ext == ".docx":
         return read_docx(path)
     if ext == ".txt":
         return read_txt(path)
+
     raise ValueError(f"Unsupported file type: {ext}")
+
+    
 
 def extract_email(text):
     m = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
     return m.group(0) if m else None
 
-
+        
 def extract_phone(text):
     m = re.search(r"\+?\d{10,13}", text)
     return m.group(0) if m else None
@@ -79,30 +81,19 @@ def extract_phone(text):
 
 def extract_dob(text):
     patterns = [
-        # DD/MM/YYYY or DD-MM-YYYY
         r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
-
-        # DD Month YYYY  (01 Jan 2006)
-        r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b",
-
-        # DD Month, YYYY (01 Jan, 2006)
-        r"\b\d{1,2}\s+[A-Za-z]{3,9},\s*\d{4}\b",
-
-        # With labels: DOB / Date of Birth
+        r"\b\d{1,2}\s+[A-Za-z]{3,9},?\s*\d{4}\b",
         r"\b(?:DOB|Date\s*of\s*Birth)\s*[:\-]?\s*\d{1,2}\s+[A-Za-z]{3,9},?\s*\d{4}\b",
     ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            # Return only the date part (remove label if present)
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
             return re.sub(
-                r"^(?:DOB|Date\s*of\s*Birth)\s*[:\-]?\s*",
+                r"^(DOB|Date\s*of\s*Birth)\s*[:\-]?\s*",
                 "",
-                match.group(0),
-                flags=re.IGNORECASE
-            ).strip()
-
+                m.group(0),
+                flags=re.I
+            )
     return None
 
 
@@ -113,55 +104,61 @@ def extract_gender(text):
     g = m.group(1).lower()
     return "Male" if g in ("m", "male") else "Female" if g in ("f", "female") else "Other"
 
+
 def extract_name(text):
-    """
-    Robust resume name extractor.
-    Strategy:
-    1. Look at top lines only
-    2. Remove degree/designation noise
-    3. Prefer ALL CAPS / Title Case names
-    4. Fallback to spaCy PERSON entities
-    """
+  
 
-    # --- Step 1: get top meaningful lines ---
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    top_lines = lines[:6]  # names are almost always at the top
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    top_lines = lines[:8]
 
-    # --- Step 2: common words to ignore ---
+    
     ignore_words = [
         "b.tech", "m.tech", "b.e", "m.e", "mba", "msc", "bsc",
-        "electronics", "communication", "engineering",
-        "computer", "science", "technology",
-        "resume", "curriculum vitae", "cv"
+        "engineering", "technology", "computer",
+        "resume", "curriculum vitae", "cv",
+        "student", "intern", "engineer", "developer", "profile",
+        "electronics", "communication","Brief","Summary"
     ]
 
     def is_noise(line):
         l = line.lower()
-        return any(word in l for word in ignore_words)
+        return any(w in l for w in ignore_words)
 
-    # --- Step 3: regex-based name detection ---
+    def clean_name(line):
+        return re.sub(r"[^A-Za-z.\s]", " ", line).strip()
+
+   
+    for line in top_lines:
+        m = re.search(r"\bname\s*[:\-]\s*(.+)", line, re.I)
+        if m:
+            candidate = clean_name(m.group(1))
+            words = candidate.split()
+            if 2 <= len(words) <= 5:
+                return candidate.title()
+
+    
     for line in top_lines:
         if is_noise(line):
             continue
 
-        # Remove extra symbols
-        clean = re.sub(r"[^A-Za-z\s]", " ", line).strip()
+        clean = clean_name(line)
         words = clean.split()
 
-        # ALL CAPS name (ARCHANA BHAGAT)
-        if clean.isupper() and 2 <= len(words) <= 4:
+        if not (2 <= len(words) <= 5):
+            continue
+
+        if clean.replace(".", "").isupper():
             return clean.title()
 
-        # Title Case name (Archana Bhagat)
-        if all(w[0].isupper() for w in words if len(w) > 1) and 2 <= len(words) <= 4:
+        if all(w[0].isupper() for w in words if len(w) > 1):
             return clean
 
-    # --- Step 4: spaCy fallback ---
+   
     doc = nlp(" ".join(top_lines))
     for ent in doc.ents:
         if ent.label_ == "PERSON":
-            name = ent.text.strip()
-            if 2 <= len(name.split()) <= 4:
+            name = clean_name(ent.text)
+            if 2 <= len(name.split()) <= 5:
                 return name
 
     return None
@@ -177,12 +174,10 @@ def extract_entities(raw_text):
         "gender": extract_gender(raw_text),
     }
 
-# --------------------------------------------------
-# MYSQL STORAGE (OPTIONAL)
-# --------------------------------------------------
-def save_to_mysql(entity):
+
+def save_and_fetch_mysql(entity):
     conn = mysql.connector.connect(**MYSQL_CONFIG)
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
 
     cursor.execute(
         """
@@ -190,6 +185,7 @@ def save_to_mysql(entity):
         VALUES (%s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             name = VALUES(name),
+            mobile = VALUES(mobile),
             dob = VALUES(dob),
             gender = VALUES(gender)
         """,
@@ -203,90 +199,62 @@ def save_to_mysql(entity):
     )
 
     conn.commit()
+
+    cursor.execute(
+        """
+        SELECT id, name, email, mobile, dob, gender
+        FROM resume_entities
+        WHERE email = %s
+        """,
+        (entity["email"],)
+    )
+
+    rows = cursor.fetchall()
+    row = rows[0] if rows else None
+
     cursor.close()
     conn.close()
 
-    logger.info("Saved record to MySQL")
+    return row
 
-# --------------------------------------------------
-# S3 JSON STORAGE (FOR SNOWFLAKE)
-# --------------------------------------------------
-def save_json_to_s3(entity, source_filename):
-    payload = {
-        **entity,
-        "source_file": source_filename,
-        "ingested_at": datetime.utcnow().isoformat()
-    }
 
-    json_key = f"processed/{source_filename}.json"
+def save_csv_to_s3(row):
+    filename = f"{row['id']}.csv"
 
-    s3.put_object(
-        Bucket=BUCKET_NAME,
-        Key=json_key,
-        Body=json.dumps(payload),
-        ContentType="application/json"
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "name", "email", "mobile", "dob", "gender"])
+        writer.writerow([
+            row["id"],
+            row["name"],
+            row["email"],
+            row["mobile"],
+            row["dob"],
+            row["gender"],
+        ])
+
+    s3.upload_file(
+        filename,
+        BUCKET_NAME,
+        f"processed/{filename}"
     )
 
-    logger.info(f"JSON written to S3: {json_key}")
+    os.remove(filename)
+    logger.info(f"CSV uploaded to S3: processed/{filename}")
 
-# -------------------ssssssssssss-------------------------------
-# MAIN PIPELINE
-# --------------------------------------------------
+
 def run_pipeline(local_file):
     raw_text = read_file(local_file)
 
-    if not raw_text.strip():
-        raise ValueError("Empty or unreadable file")
+    if not raw_text or len(raw_text.strip()) < 30:
+        raise ValueError(
+            "This file appears to be scanned or contains no readable text."
+        )
 
     entity = extract_entities(raw_text)
     logger.info(f"Extracted: {entity}")
 
-    save_to_mysql(entity)
-    save_json_to_s3(entity, os.path.basename(local_file))
+    row = save_and_fetch_mysql(entity)
+    save_csv_to_s3(row)
 
     return entity
-
-# --------------------------------------------------
-# S3 BATCH PROCESS (PDF → JSON)
-# --------------------------------------------------
-def process_s3_files():
-    response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="incoming/")
-
-    if "Contents" not in response:
-        logger.info("No incoming files found")
-        return
-
-    for obj in response["Contents"]:
-        key = obj["Key"]
-        filename = os.path.basename(key)
-
-        if not filename.lower().endswith(SUPPORTED_EXTENSIONS):
-            continue
-
-        logger.info(f"Processing {filename}")
-        s3.download_file(BUCKET_NAME, key, filename)
-
-        try:
-            run_pipeline(filename)
-
-            s3.delete_object(Bucket=BUCKET_NAME, Key=key)
-            logger.info(f"Processed and removed {filename}")
-
-        except Exception as e:
-            logger.error(f"Failed processing {filename}: {e}")
-            s3.copy_object(
-                Bucket=BUCKET_NAME,
-                CopySource={"Bucket": BUCKET_NAME, "Key": key},
-                Key=f"failed/{filename}",
-            )
-            s3.delete_object(Bucket=BUCKET_NAME, Key=key)
-
-        finally:
-            if os.path.exists(filename):
-                os.remove(filename)
-
-# --------------------------------------------------
-# ENTRY
-# --------------------------------------------------
-if __name__ == "__main__":
-    process_s3_files()

@@ -11,12 +11,17 @@ An automated, production-style data engineering pipeline that extracts structure
 This project is an <b>end-to-end resume processing pipeline</b> that automatically extracts key information from resumes and makes it available for analytics and reporting.
 </p>
 
+<p align="center">
+  <img src="screenshots/NER1.png" alt="Resume NER Pipeline UI" width="850"/>
+</p>
+
+
 <p>
 It covers the complete data journey:
 </p>
 
 <p align="center">
-<b>Resume → NER → MySQL (RDS) → CSV → S3 → Snowflake → Power BI</b>
+<b>Resume → NER → MySQL (workbench) → CSV → S3 → Snowflake → Power BI</b>
 </p>
 
 <p>
@@ -38,7 +43,7 @@ The system supports real-world resumes (<b>PDF, DOCX, TXT</b>), handles noisy fo
       <li>Gender</li>
     </ul>
   </li>
-  <li>Extracted data is inserted into <b>MySQL (AWS RDS)</b></li>
+  <li>Extracted data is inserted into <b>MySQL </b></li>
   <li>The inserted record is converted into a <b>CSV file</b></li>
   <li>CSV is uploaded to <b>Amazon S3</b></li>
   <li><b>Snowpipe</b> automatically ingests data into <b>Snowflake</b></li>
@@ -48,36 +53,6 @@ The system supports real-world resumes (<b>PDF, DOCX, TXT</b>), handles noisy fo
 <p><b>All steps are fully automated after resume upload.</b></p>
 
 <hr/>
-
-<h2>🏗️ Architecture</h2>
-
-<pre>
-Streamlit UI
-     |
-     v
-Resume File (PDF / DOCX / TXT)
-     |
-     v
-NER Extraction (spaCy + Regex)
-     |
-     v
-MySQL (RDS)
-     |
-     v
-CSV Generation
-     |
-     v
-Amazon S3 (processed/)
-     |
-     v
-Snowpipe (Auto-Ingest)
-     |
-     v
-Snowflake
-     |
-     v
-Power BI Dashboard
-</pre>
 
 <hr/>
 
@@ -99,7 +74,7 @@ Power BI Dashboard
 
 <h3>Databases</h3>
 <ul>
-  <li>MySQL (AWS RDS)</li>
+  <li>MySQL (workbench)</li>
   <li>Snowflake</li>
 </ul>
 
@@ -121,17 +96,13 @@ Power BI Dashboard
 
 <pre>
 resume_pipeline/
-│
+│__ screenshots
 ├── streamlit_app.py           # UI for resume upload
 ├── resume_ner_to_mysql.py     # Core pipeline logic
 ├── .env                       # Environment variables
 ├── .env.example               # Sample env file
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # Project documentation
-│
-├── sample_resumes/
-│   ├── sample.pdf
-│   ├── sample.docx
 │
 └── venv/                      # Virtual environment
 </pre>
@@ -276,3 +247,165 @@ streamlit run streamlit_app.py
   <li>Scalable and production-ready</li>
   <li>Reflects real HR / ATS resume processing systems</li>
 </ul>
+
+<hr/>
+
+<h2>🧭 End-to-End Workflow (With Screenshots)</h2>
+
+<p>
+This section visually explains how a resume moves through the system — from upload to analytics —
+using real screenshots, AWS configuration, and Snowflake SQL.
+</p>
+<h3>0️⃣ Resume Upload & NER Extraction</h3>
+
+<p>
+The user uploads a resume using the Streamlit UI.  
+The backend extracts text and applies <b>spaCy + Regex</b> to identify structured entities.
+</p>
+
+<p align="center">
+  <img src="screenshots/NER1.png" width="850"/>
+  <br/>
+  <i>Streamlit UI – Resume Upload & NER Output</i>
+</p>
+
+<h3>1️⃣ CSV Upload to Amazon S3</h3>
+
+<p>
+After successful extraction and insertion into MySQL, the record is converted into a CSV file
+and uploaded to the S3 bucket:
+</p>
+
+<pre>
+s3://resume-input-pdfs/processed/
+</pre>
+
+<p align="center">
+  <img src="screenshots/bucket.png" width="850"/>
+  <br/>
+  <i>S3 Bucket – Processed CSV Files</i>
+</p>
+
+<pre>
+import boto3
+
+s3 = boto3.client("s3")
+
+s3.upload_file(
+    Filename="resume_data.csv",
+    Bucket="resume-input-pdfs",
+    Key="processed/resume_data.csv"
+)
+</pre>
+
+<h3>2️⃣ Snowflake Pipe & Notification Channel</h3>
+
+<p>
+Snowpipe is configured to automatically ingest CSV files from S3.
+The pipe is linked to an <b>Amazon SQS notification channel</b>.
+</p>
+
+<p align="center">
+  <img src="screenshots/notification_channel.png" width="850"/>
+  <br/>
+  <i>Snowflake Notification Channel</i>
+</p>
+<pre>
+CREATE OR REPLACE NOTIFICATION INTEGRATION resume_s3_notification
+TYPE = QUEUE
+NOTIFICATION_PROVIDER = AWS_SQS
+ENABLED = TRUE
+AWS_SQS_ARN = 'arn:aws:sqs:ap-south-1:xxxx:resume-sqs-queue';
+</pre>
+<pre>
+DESC PIPE resume_pipe;
+</pre>
+<h3>3️⃣ Configure S3 Event Notifications</h3>
+
+<p>
+The S3 bucket is configured to notify Snowflake via SQS whenever
+a new CSV file is uploaded to the <code>processed/</code> folder.
+</p>
+
+<p align="center">
+  <img src="screenshots/event_notification.png" width="850"/>
+  <br/>
+  <i>S3 Event Notification Configuration</i>
+</p>
+
+<h3>4️⃣ Attach SQS Queue to S3 Bucket</h3>
+
+<p>
+The S3 bucket sends event notifications to the SQS queue
+used by Snowflake Snowpipe.
+</p>
+
+<p align="center">
+  <img src="screenshots/sqs_S3.png" width="850"/>
+  <br/>
+  <i>S3 → SQS Integration</i>
+</p>
+
+<pre>
+Event type      : PUT
+Prefix filter   : processed/
+Destination     : SQS Queue
+</pre>
+
+<h3>5️⃣ Snowpipe Auto-Ingest into Snowflake</h3>
+
+<p>
+Once the CSV arrives in S3:
+</p>
+
+<ul>
+  <li>S3 sends event to SQS</li>
+  <li>Snowpipe detects the event</li>
+  <li>CSV is automatically loaded into Snowflake</li>
+</ul>
+
+<p><b>No manual COPY commands are required.</b></p>
+
+<pre>
+CREATE OR REPLACE PIPE resume_pipe
+AUTO_INGEST = TRUE
+INTEGRATION = resume_s3_notification
+AS
+COPY INTO RESUME_ENTITIES
+FROM @resume_stage
+FILE_FORMAT = (TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY='"')
+ON_ERROR = 'CONTINUE';
+</pre>
+
+
+<h3>6️⃣ Power BI Analytics</h3>
+
+<p>
+Power BI connects directly to Snowflake and visualizes the
+ingested resume data for reporting and insights.
+</p>
+
+<p>
+This completes the fully automated, event-driven data pipeline.
+</p>
+<pre>
+Streamlit UI
+   ↓
+NER Extraction
+   ↓
+MySQL
+   ↓
+CSV
+   ↓
+S3 (processed/)
+   ↓
+SQS
+   ↓
+Snowpipe
+   ↓
+Snowflake
+   ↓
+Power BI
+</pre>
+
+

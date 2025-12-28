@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import logging
+from typing import List, Union
 
 import pdfplumber
 import spacy
@@ -10,10 +11,15 @@ import boto3
 from docx import Document
 from dotenv import load_dotenv
 
-
+# --------------------------------------------------
+# ENV + LOGGING
+# --------------------------------------------------
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------
@@ -28,11 +34,13 @@ MYSQL_CONFIG = {
     "database": os.getenv("MYSQL_DB"),
 }
 
-SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".txt")
-
 s3 = boto3.client("s3")
 nlp = spacy.load("en_core_web_sm")
-def read_pdf(path):
+
+# --------------------------------------------------
+# FILE READERS
+# --------------------------------------------------
+def read_pdf(path: str) -> str:
     text = ""
     try:
         with pdfplumber.open(path) as pdf:
@@ -41,21 +49,33 @@ def read_pdf(path):
                 if page_text:
                     text += page_text + "\n"
     except Exception as e:
-        logger.error(f"PDF read error: {e}")
+        logger.error(f"PDF read failed: {e}")
     return text.strip()
 
 
-def read_docx(path):
-    doc = Document(path)
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+def read_docx(path: str) -> str:
+    try:
+        doc = Document(path)
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception as e:
+        logger.error(f"DOCX read failed: {e}")
+        return ""
 
 
-def read_txt(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+def read_txt(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception as e:
+        logger.error(f"TXT read failed: {e}")
+        return ""
 
 
-def read_file(path):
+def read_any_file(path: str) -> str:
+    """
+    Reads known formats properly.
+    Unknown formats are attempted as text.
+    """
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".pdf":
@@ -65,35 +85,39 @@ def read_file(path):
     if ext == ".txt":
         return read_txt(path)
 
-    raise ValueError(f"Unsupported file type: {ext}")
+    logger.warning(f"Unknown file type {ext}. Attempting raw text read.")
+    return read_txt(path)
 
-    
-
+# --------------------------------------------------
+# EXTRACTION HELPERS
+# --------------------------------------------------
 def extract_email(text):
     m = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
     return m.group(0) if m else None
 
-        
+
 def extract_phone(text):
-    m = re.search(r"\+?\d{10,13}", text)
-    return m.group(0) if m else None
+    text = re.sub(r"[^\d+]", " ", text)
+    candidates = re.findall(r"\+?\d{10,13}", text)
+
+    for c in candidates:
+        digits = re.sub(r"\D", "", c)
+        if len(digits) > 10:
+            digits = digits[-10:]
+        if len(digits) == 10 and digits[0] in "6789":
+            return digits
+    return None
 
 
 def extract_dob(text):
     patterns = [
         r"\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b",
         r"\b\d{1,2}\s+[A-Za-z]{3,9},?\s*\d{4}\b",
-        r"\b(?:DOB|Date\s*of\s*Birth)\s*[:\-]?\s*\d{1,2}\s+[A-Za-z]{3,9},?\s*\d{4}\b",
     ]
     for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
+        m = re.search(p, text, re.I)
         if m:
-            return re.sub(
-                r"^(DOB|Date\s*of\s*Birth)\s*[:\-]?\s*",
-                "",
-                m.group(0),
-                flags=re.I
-            )
+            return m.group(0)
     return None
 
 
@@ -106,13 +130,10 @@ def extract_gender(text):
 
 
 def extract_name(text):
-  
-
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    top_lines = lines[:8]
+    top = lines[:8]
 
-    
-    ignore_words = [
+    ignore = [
         "b.tech", "m.tech", "b.e", "m.e", "mba", "msc", "bsc",
         "engineering", "technology", "computer",
         "resume", "curriculum vitae", "cv",
@@ -120,64 +141,52 @@ def extract_name(text):
         "electronics", "communication","Brief","Summary"
     ]
 
-    def is_noise(line):
-        l = line.lower()
-        return any(w in l for w in ignore_words)
+    def noisy(line):
+        return any(w in line.lower() for w in ignore)
 
-    def clean_name(line):
+    def clean(line):
         return re.sub(r"[^A-Za-z.\s]", " ", line).strip()
 
-   
-    for line in top_lines:
-        m = re.search(r"\bname\s*[:\-]\s*(.+)", line, re.I)
-        if m:
-            candidate = clean_name(m.group(1))
-            words = candidate.split()
-            if 2 <= len(words) <= 5:
-                return candidate.title()
-
-    
-    for line in top_lines:
-        if is_noise(line):
+    for line in top:
+        if noisy(line):
             continue
 
-        clean = clean_name(line)
-        words = clean.split()
+        c = clean(line)
+        words = c.split()
 
-        if not (2 <= len(words) <= 5):
-            continue
+        if 2 <= len(words) <= 5:
+            if c.replace(".", "").isupper():
+                return c.title()
+            if all(w[0].isupper() for w in words if len(w) > 1):
+                return c
 
-        if clean.replace(".", "").isupper():
-            return clean.title()
-
-        if all(w[0].isupper() for w in words if len(w) > 1):
-            return clean
-
-   
-    doc = nlp(" ".join(top_lines))
+    doc = nlp(" ".join(top))
     for ent in doc.ents:
         if ent.label_ == "PERSON":
-            name = clean_name(ent.text)
+            name = clean(ent.text)
             if 2 <= len(name.split()) <= 5:
                 return name
 
     return None
 
-
-
-def extract_entities(raw_text):
+# --------------------------------------------------
+# ENTITY PIPELINE
+# --------------------------------------------------
+def extract_entities(text):
     return {
-        "name": extract_name(raw_text),
-        "email": extract_email(raw_text),
-        "mobile": extract_phone(raw_text),
-        "dob": extract_dob(raw_text),
-        "gender": extract_gender(raw_text),
+        "name": extract_name(text),
+        "email": extract_email(text),
+        "mobile": extract_phone(text),
+        "dob": extract_dob(text),
+        "gender": extract_gender(text),
     }
 
-
+# --------------------------------------------------
+# MYSQL + S3
+# --------------------------------------------------
 def save_and_fetch_mysql(entity):
     conn = mysql.connector.connect(**MYSQL_CONFIG)
-    cursor = conn.cursor(dictionary=True)
+    cursor = conn.cursor(dictionary=True, buffered=True)
 
     cursor.execute(
         """
@@ -201,20 +210,14 @@ def save_and_fetch_mysql(entity):
     conn.commit()
 
     cursor.execute(
-        """
-        SELECT id, name, email, mobile, dob, gender
-        FROM resume_entities
-        WHERE email = %s
-        """,
+        "SELECT * FROM resume_entities WHERE email = %s",
         (entity["email"],)
     )
 
-    rows = cursor.fetchall()
-    row = rows[0] if rows else None
+    row = cursor.fetchone()
 
     cursor.close()
     conn.close()
-
     return row
 
 
@@ -223,38 +226,55 @@ def save_csv_to_s3(row):
 
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "name", "email", "mobile", "dob", "gender"])
-        writer.writerow([
-            row["id"],
-            row["name"],
-            row["email"],
-            row["mobile"],
-            row["dob"],
-            row["gender"],
-        ])
+        writer.writerow(row.keys())
+        writer.writerow(row.values())
 
-    s3.upload_file(
-        filename,
-        BUCKET_NAME,
-        f"processed/{filename}"
-    )
-
+    s3.upload_file(filename, BUCKET_NAME, f"processed/{filename}")
     os.remove(filename)
-    logger.info(f"CSV uploaded to S3: processed/{filename}")
 
+    logger.info(f"Uploaded CSV to S3: processed/{filename}")
 
-def run_pipeline(local_file):
-    raw_text = read_file(local_file)
+# --------------------------------------------------
+# MAIN ENTRY (SINGLE OR MULTIPLE FILES)
+# --------------------------------------------------
+def run_pipeline(files: Union[str, List[str]]):
+    """
+    Accepts:
+    - single file path
+    - list of file paths
+    """
+    if isinstance(files, str):
+        files = [files]
 
-    if not raw_text or len(raw_text.strip()) < 30:
-        raise ValueError(
-            "This file appears to be scanned or contains no readable text."
-        )
+    results = []
 
-    entity = extract_entities(raw_text)
-    logger.info(f"Extracted: {entity}")
+    for file_path in files:
+        logger.info(f"Processing: {file_path}")
 
-    row = save_and_fetch_mysql(entity)
-    save_csv_to_s3(row)
+        try:
+            text = read_any_file(file_path)
 
-    return entity
+            if not text or len(text.strip()) < 30:
+                raise ValueError("No readable text found")
+
+            entity = extract_entities(text)
+            logger.info(f"Extracted: {entity}")
+
+            row = save_and_fetch_mysql(entity)
+            save_csv_to_s3(row)
+
+            results.append({
+                "file": os.path.basename(file_path),
+                "status": "success",
+                "data": entity
+            })
+
+        except Exception as e:
+            logger.error(f"Failed processing {file_path}: {e}")
+            results.append({
+                "file": os.path.basename(file_path),
+                "status": "failed",
+                "error": str(e)
+            })
+
+    return results

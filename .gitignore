@@ -11,3 +11,6 @@ __pycache__/
 
 # PDFs or private files (optional)
 *.pdf
+*.csv
+
+QWEN.md
